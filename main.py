@@ -13,29 +13,42 @@ import firebase_admin
 from firebase_admin import credentials, auth
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-# Load environment variables
+# Load environment variables from .env file (local)
 load_dotenv()
 
-# ===== CONFIGURATION =====
+# ============================================================
+# CONFIGURATION (read from environment)
+# ============================================================
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
-FIREBASE_CRED_JSON = os.getenv("FIREBASE_CRED_JSON")
+FIREBASE_CRED_JSON = os.getenv("FIREBASE_CRED_JSON")   # entire JSON as string
+FIREBASE_CRED_PATH = os.getenv("FIREBASE_CRED_PATH")   # or path to .json file
 
 if not GEMINI_KEY:
-    raise Exception("GEMINI_KEY not set in .env")
+    raise Exception("GEMINI_KEY environment variable not set")
 if not MONGO_URI:
-    raise Exception("MONGO_URI not set in .env")
-if not FIREBASE_CRED_JSON:
-    raise Exception("FIREBASE_CRED_JSON not set in .env")
+    raise Exception("MONGO_URI environment variable not set")
 
-# ===== FIREBASE ADMIN SDK =====
-try:
-    cred_dict = json.loads(FIREBASE_CRED_JSON)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-    print("✅ Firebase Admin SDK initialized")
-except Exception as e:
-    raise Exception(f"Firebase init failed: {e}")
+# ============================================================
+# FIREBASE ADMIN SDK INITIALIZATION
+# ============================================================
+def init_firebase():
+    if FIREBASE_CRED_PATH and os.path.exists(FIREBASE_CRED_PATH):
+        cred = credentials.Certificate(FIREBASE_CRED_PATH)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase initialized from file:", FIREBASE_CRED_PATH)
+    elif FIREBASE_CRED_JSON:
+        try:
+            cred_dict = json.loads(FIREBASE_CRED_JSON)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            print("✅ Firebase initialized from env var")
+        except Exception as e:
+            raise Exception(f"Failed to parse FIREBASE_CRED_JSON: {e}")
+    else:
+        raise Exception("No Firebase credentials provided (set FIREBASE_CRED_JSON or FIREBASE_CRED_PATH)")
+
+init_firebase()
 
 security = HTTPBearer()
 
@@ -47,51 +60,15 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
-# ===== MONGODB =====
+# ============================================================
+# MONGODB
+# ============================================================
 client = pymongo.MongoClient(MONGO_URI)
 db = client["leo"]
 chats_col = db["chats"]
 chats_col.create_index("user_id")
 chats_col.create_index("timestamp")
 
-# ===== GEMINI AI =====
-genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-pro")
-
-# ===== FASTAPI APP =====
-app = FastAPI(title="Leo Backend", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ===== PYDANTIC MODELS =====
-class ChatRequest(BaseModel):
-    message: str
-
-class SceneUpdateRequest(BaseModel):
-    objectType: Optional[str] = None
-    color: Optional[str] = None
-    mass: Optional[float] = None
-    gravity: Optional[float] = None
-    isAnimating: Optional[bool] = None
-    position: Optional[List[float]] = None
-
-# ===== SCENE STATE (in-memory) =====
-scene_state = {
-    "objectType": "box",
-    "color": "#f43f5e",
-    "mass": 1.0,
-    "gravity": 9.8,
-    "isAnimating": False,
-    "position": [0, 1, 0]
-}
-
-# ===== HELPERS =====
 def get_history(user_id: str, limit: int = 20):
     docs = chats_col.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
     return [{"message": d["message"], "reply": d["reply"]} for d in docs]
@@ -104,12 +81,18 @@ def save_chat(user_id: str, message: str, reply: str):
         "timestamp": time.time()
     })
 
+# ============================================================
+# GEMINI AI
+# ============================================================
+genai.configure(api_key=GEMINI_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-pro")
+
 def build_prompt(user_message: str, context: List[str]) -> str:
     context_str = "\n".join([f"- {c}" for c in context[-5:]]) if context else "No previous context."
     return f"""
-You are Leo, an enthusiastic, expert physics tutor and 3D builder. 
-Explain concepts simply, step-by-step. 
-When you mention an object (sphere, cylinder, pendulum, box), a mass, gravity, or color, 
+You are Leo, an enthusiastic, expert physics tutor and 3D builder.
+Explain concepts simply, step-by-step.
+When you mention an object (sphere, cylinder, pendulum, box), a mass, gravity, or color,
 the frontend will automatically update its 3D scene.
 Example: "Imagine a red sphere with mass 5kg..." triggers scene updates.
 
@@ -120,7 +103,48 @@ User: {user_message}
 
 Leo (Physics Tutor):"""
 
-# ===== ENDPOINTS =====
+# ============================================================
+# FASTAPI APP
+# ============================================================
+app = FastAPI(title="Leo Backend", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # For production, restrict to your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# PYDANTIC MODELS
+# ============================================================
+class ChatRequest(BaseModel):
+    message: str
+
+class SceneUpdateRequest(BaseModel):
+    objectType: Optional[str] = None
+    color: Optional[str] = None
+    mass: Optional[float] = None
+    gravity: Optional[float] = None
+    isAnimating: Optional[bool] = None
+    position: Optional[List[float]] = None
+
+# ============================================================
+# SCENE STATE (in-memory – resets on restart)
+# ============================================================
+scene_state = {
+    "objectType": "box",
+    "color": "#f43f5e",
+    "mass": 1.0,
+    "gravity": 9.8,
+    "isAnimating": False,
+    "position": [0, 1, 0]
+}
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(verify_token)):
@@ -128,11 +152,11 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(verify_toke
     # 1. Get history
     history = get_history(user_id, limit=10)
     context = [h["message"] for h in history]
-    
+
     # 2. Build prompt
     prompt = build_prompt(request.message, context)
-    
-    # 3. Define generator for streaming
+
+    # 3. Generator for streaming
     def generate():
         full_reply = ""
         try:
@@ -148,17 +172,16 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(verify_toke
         except Exception as e:
             yield f"\n\n⚠️ Error: {str(e)}"
         finally:
-            # Save to MongoDB after streaming completes
+            # Save after streaming completes
             if full_reply:
                 save_chat(user_id, request.message, full_reply)
-    
+
     return StreamingResponse(generate(), media_type="text/plain")
 
 @app.get("/api/history")
 async def history_endpoint(user_id: str = Depends(verify_token)):
     """Returns the user's chat history."""
-    history = get_history(user_id, limit=50)
-    return history
+    return get_history(user_id, limit=50)
 
 @app.get("/api/scene/state")
 async def get_scene_state():
@@ -167,7 +190,7 @@ async def get_scene_state():
 
 @app.post("/api/scene/update")
 async def update_scene_state(request: SceneUpdateRequest):
-    """Update the 3D scene state (persisted in memory)."""
+    """Update the 3D scene state."""
     if request.objectType is not None:
         scene_state["objectType"] = request.objectType
     if request.color is not None:
@@ -186,6 +209,10 @@ async def update_scene_state(request: SceneUpdateRequest):
 async def health():
     return {"status": "ok", "service": "Leo Backend v1.0"}
 
+# ============================================================
+# RUN SERVER (production uses PORT from environment)
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
